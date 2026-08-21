@@ -16,6 +16,10 @@
     }
   ],
 
+  "images": {
+    "binding": "IMAGE_TRANSFORMER"
+  },
+
   "observability": {
     "enabled": true
   }
