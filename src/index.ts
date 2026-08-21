@@ -49,14 +49,14 @@ function bytesToBase64(bytes: Uint8Array) {
 function createServer(env: Env, origin: string) {
 	const server = new McpServer({
 		name: "Gemini Images for Claude",
-		version: "3.0.0",
+		version: "3.1.0",
 	});
 
 	server.registerTool(
 		"generate_image",
 		{
 			description:
-				"Generate an AI image with Google Gemini, optimize it as WebP for e-commerce, save it to Cloudflare R2, and return a reusable file URL.",
+				"Generate an AI image with Google Gemini, convert it to optimized WebP, save it as a real file in Cloudflare R2, and return the image and reusable file URL.",
 
 			inputSchema: {
 				prompt: z
@@ -70,7 +70,7 @@ function createServer(env: Env, origin: string) {
 					.string()
 					.optional()
 					.describe(
-						"Desired filename without extension, for example lavande-vraie-jardin-xixe.",
+						"Desired SEO-friendly filename without extension, for example lavande-vraie-jardin-xixe.",
 					),
 
 				aspect_ratio: z
@@ -90,11 +90,17 @@ function createServer(env: Env, origin: string) {
 						"16:9",
 						"21:9",
 					])
-					.default("1:1"),
+					.default("1:1")
+					.describe(
+						"Aspect ratio of the image.",
+					),
 
 				image_size: z
 					.enum(["512", "1K", "2K", "4K"])
-					.default("1K"),
+					.default("1K")
+					.describe(
+						"Resolution requested from Gemini.",
+					),
 			},
 		},
 
@@ -105,7 +111,7 @@ function createServer(env: Env, origin: string) {
 			image_size,
 		}) => {
 			/*
-			 * 1. Generate the original image with Gemini
+			 * 1. Generate image with Gemini.
 			 */
 			const response = await fetch(
 				"https://generativelanguage.googleapis.com/v1beta/interactions",
@@ -145,8 +151,7 @@ function createServer(env: Env, origin: string) {
 						{
 							type: "text",
 							text:
-								`Gemini API error (${response.status}): ` +
-								errorText,
+								`Gemini API error (${response.status}): ${errorText}`,
 						},
 					],
 				};
@@ -156,7 +161,8 @@ function createServer(env: Env, origin: string) {
 
 			const allContent =
 				data?.steps?.flatMap(
-					(step: any) => step?.content ?? [],
+					(step: any) =>
+						step?.content ?? [],
 				) ?? [];
 
 			const imageItem = allContent.find(
@@ -172,41 +178,54 @@ function createServer(env: Env, origin: string) {
 						{
 							type: "text",
 							text:
-								"Gemini completed the request but no image data was found.",
+								"Gemini completed the request but no image data was found in the response.",
 						},
 					],
 				};
 			}
 
 			/*
-			 * 2. Decode Gemini image
+			 * 2. Decode original Gemini image.
 			 */
 			const originalBytes =
 				base64ToBytes(imageItem.data);
 
 			/*
-			 * 3. Convert to WebP
+			 * 3. Create a ReadableStream for Cloudflare Images.
 			 *
-			 * Maximum 1600 x 1600.
-			 * scale-down preserves aspect ratio
-			 * and never enlarges smaller images.
-			 *
-			 * WebP quality = 80.
+			 * No resize and no .transform().
+			 * We only transcode the original Gemini image
+			 * into a genuine WebP at quality 80.
 			 */
-			const transformed = await env
-				.IMAGE_TRANSFORMER
-				.input(originalBytes)
-				.transform({
-					width: 1600,
-					height: 1600,
-					fit: "scale-down",
-				})
-				.output({
-					format: "image/webp",
-					quality: 80,
-				});
+			const sourceStream =
+				new Response(originalBytes).body;
 
-			const webpResponse = transformed.response();
+			if (!sourceStream) {
+				return {
+					isError: true,
+					content: [
+						{
+							type: "text",
+							text:
+								"Unable to create an image stream for WebP conversion.",
+						},
+					],
+				};
+			}
+
+			/*
+			 * 4. Convert to real WebP.
+			 */
+			const transformed =
+				await env.IMAGE_TRANSFORMER
+					.input(sourceStream)
+					.output({
+						format: "image/webp",
+						quality: 80,
+					});
+
+			const webpResponse =
+				transformed.response();
 
 			if (!webpResponse.ok) {
 				const errorText =
@@ -218,34 +237,50 @@ function createServer(env: Env, origin: string) {
 						{
 							type: "text",
 							text:
-								`WebP conversion error: ${errorText}`,
+								`WebP conversion error (${webpResponse.status}): ${errorText}`,
 						},
 					],
 				};
 			}
 
-			const webpBytes = new Uint8Array(
-				await webpResponse.arrayBuffer(),
-			);
+			const webpBytes =
+				new Uint8Array(
+					await webpResponse.arrayBuffer(),
+				);
+
+			if (webpBytes.byteLength === 0) {
+				return {
+					isError: true,
+					content: [
+						{
+							type: "text",
+							text:
+								"Cloudflare returned an empty WebP file.",
+						},
+					],
+				};
+			}
 
 			/*
-			 * 4. Build final SEO-friendly filename
+			 * 5. Build final filename.
 			 */
 			const basename =
 				cleanFilename(filename ?? "") ||
 				`gemini-${crypto.randomUUID()}`;
 
-			const key = `${basename}.webp`;
+			const key =
+				`${basename}.webp`;
 
 			/*
-			 * 5. Store ONLY the optimized WebP in R2
+			 * 6. Store ONLY the optimized WebP in R2.
 			 */
 			await env.IMAGES.put(
 				key,
 				webpBytes,
 				{
 					httpMetadata: {
-						contentType: "image/webp",
+						contentType:
+							"image/webp",
 
 						contentDisposition:
 							`inline; filename="${key}"`,
@@ -262,8 +297,14 @@ function createServer(env: Env, origin: string) {
 			const webpBase64 =
 				bytesToBase64(webpBytes);
 
+			const sizeKb =
+				Math.round(
+					webpBytes.byteLength /
+						1024,
+				);
+
 			/*
-			 * 6. Return the actual optimized WebP to Claude
+			 * 7. Return optimized WebP to Claude.
 			 */
 			return {
 				content: [
@@ -273,16 +314,18 @@ function createServer(env: Env, origin: string) {
 						text:
 							`Image generated and optimized successfully.\n` +
 							`Format: WebP\n` +
-							`Quality: 80\n` +
-							`Maximum dimensions: 1600 × 1600 px\n` +
+							`WebP quality: 80\n` +
+							`Gemini resolution preserved\n` +
 							`Filename: ${key}\n` +
+							`File size: approximately ${sizeKb} KB\n` +
 							`File URL: ${fileUrl}`,
 					},
 
 					{
 						type: "image",
 						data: webpBase64,
-						mimeType: "image/webp",
+						mimeType:
+							"image/webp",
 					},
 
 					{
@@ -292,10 +335,13 @@ function createServer(env: Env, origin: string) {
 						uri: fileUrl,
 
 						description:
-							"Optimized WebP image generated by Gemini and stored in Cloudflare R2.",
+							"Optimized WebP image generated with Gemini and stored as a real file in Cloudflare R2.",
 
-						mimeType: "image/webp",
-						size: webpBytes.byteLength,
+						mimeType:
+							"image/webp",
+
+						size:
+							webpBytes.byteLength,
 					},
 				],
 			};
@@ -311,20 +357,24 @@ export default {
 		env: Env,
 		ctx: ExecutionContext,
 	) {
-		const url = new URL(request.url);
+		const url =
+			new URL(request.url);
 
 		/*
-		 * Serve generated WebP files
+		 * Serve generated WebP files from R2.
 		 */
 		if (
 			request.method === "GET" &&
-			url.pathname.startsWith("/files/")
+			url.pathname.startsWith(
+				"/files/",
+			)
 		) {
-			const key = decodeURIComponent(
-				url.pathname.substring(
-					"/files/".length,
-				),
-			);
+			const key =
+				decodeURIComponent(
+					url.pathname.substring(
+						"/files/".length,
+					),
+				);
 
 			const object =
 				await env.IMAGES.get(key);
@@ -332,14 +382,18 @@ export default {
 			if (object === null) {
 				return new Response(
 					"Image not found",
-					{ status: 404 },
+					{
+						status: 404,
+					},
 				);
 			}
 
 			const headers =
 				new Headers();
 
-			object.writeHttpMetadata(headers);
+			object.writeHttpMetadata(
+				headers,
+			);
 
 			headers.set(
 				"etag",
@@ -353,10 +407,15 @@ export default {
 
 			return new Response(
 				object.body,
-				{ headers },
+				{
+					headers,
+				},
 			);
 		}
 
+		/*
+		 * Handle MCP requests.
+		 */
 		const handler =
 			createMcpHandler(
 				() =>
