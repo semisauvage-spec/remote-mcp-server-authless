@@ -3,12 +3,20 @@
  * https://developers.cloudflare.com/workers/wrangler/configuration/
  */
 {
-	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "remote-mcp-server-authless",
-	"main": "src/index.ts",
-	"compatibility_date": "2026-07-02",
-	"compatibility_flags": ["nodejs_compat"],
-	"observability": {
-		"enabled": true,
-	},
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "remote-mcp-server-authless",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-02",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "r2_buckets": [
+    {
+      "binding": "IMAGES",
+      "bucket_name": "gemini-images"
+    }
+  ],
+
+  "observability": {
+    "enabled": true
+  }
 }
